@@ -17,6 +17,7 @@
 package com.google.ar.core.examples.java.sharedcamera;
 
 import android.content.Context;
+import android.graphics.Bitmap;
 import android.graphics.ImageFormat;
 import android.graphics.SurfaceTexture;
 import android.hardware.camera2.CameraAccessException;
@@ -31,6 +32,7 @@ import android.media.Image;
 import android.media.ImageReader;
 import android.opengl.GLES20;
 import android.opengl.GLSurfaceView;
+import android.os.AsyncTask;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.ConditionVariable;
@@ -40,16 +42,19 @@ import android.util.Log;
 import android.util.Size;
 import android.view.MotionEvent;
 import android.view.Surface;
+import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
+
 import com.google.ar.core.Anchor;
 import com.google.ar.core.ArCoreApk;
 import com.google.ar.core.Camera;
-import com.google.ar.core.Config;
+import com.google.ar.core.CameraConfig;
+import com.google.ar.core.CameraConfigFilter;
 import com.google.ar.core.Frame;
 import com.google.ar.core.HitResult;
 import com.google.ar.core.Plane;
@@ -66,6 +71,7 @@ import com.google.ar.core.examples.java.common.helpers.FullScreenHelper;
 import com.google.ar.core.examples.java.common.helpers.SnackbarHelper;
 import com.google.ar.core.examples.java.common.helpers.TapHelper;
 import com.google.ar.core.examples.java.common.helpers.TrackingStateHelper;
+import com.google.ar.core.examples.java.common.helpers.YuvToRgbConverter;
 import com.google.ar.core.examples.java.common.rendering.BackgroundRenderer;
 import com.google.ar.core.examples.java.common.rendering.ObjectRenderer;
 import com.google.ar.core.examples.java.common.rendering.ObjectRenderer.BlendMode;
@@ -73,11 +79,17 @@ import com.google.ar.core.examples.java.common.rendering.PlaneRenderer;
 import com.google.ar.core.examples.java.common.rendering.PointCloudRenderer;
 import com.google.ar.core.exceptions.CameraNotAvailableException;
 import com.google.ar.core.exceptions.UnavailableException;
+
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.EnumSet;
 import java.util.List;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import javax.microedition.khronos.egl.EGLConfig;
 import javax.microedition.khronos.opengles.GL10;
@@ -139,6 +151,18 @@ public class SharedCameraActivity extends AppCompatActivity
   // Looper handler.
   private Handler backgroundHandler;
 
+  // Looper handler thread.
+  private HandlerThread cameraThread;
+
+  // Looper handler.
+  private Handler cameraHandler;
+
+  // Looper handler thread.
+  private HandlerThread imageReaderThread;
+
+  // Looper handler.
+  private Handler imageReaderHandler;
+
   // ARCore shared camera instance, obtained from ARCore session that supports sharing.
   private SharedCamera sharedCamera;
 
@@ -161,9 +185,15 @@ public class SharedCameraActivity extends AppCompatActivity
 
   // Camera preview capture request builder
   private CaptureRequest.Builder previewCaptureRequestBuilder;
+  private CaptureRequest.Builder stillImageCaptureRequestBuilder;
 
   // Image reader that continuously processes CPU images.
   private ImageReader cpuImageReader;
+
+  // JPG
+  private ImageReader jpgImageReader;
+  private boolean isCapturable = true;
+
 
   // Total number of CPU images processed.
   private int cpuImagesProcessed;
@@ -383,8 +413,50 @@ public class SharedCameraActivity extends AppCompatActivity
           updateSnackbarMessage();
         });
 
+    // capture button
+    Button captureBtn = findViewById(R.id.button);
+    captureBtn.setOnClickListener(view -> {
+      if (!isCapturable) {
+        return;
+      }
+      isCapturable = false;
+
+      Toast.makeText(getApplicationContext(), "hello", Toast.LENGTH_SHORT).show();
+
+      try {
+//        CaptureRequest.Builder captureRequest = captureSession.getDevice().createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
+        CaptureRequest stillCapture = stillImageCaptureRequestBuilder.build();
+        captureSession.capture(stillCapture, new CameraCaptureSession.CaptureCallback() {
+          @Override
+          public void onCaptureCompleted(@NonNull CameraCaptureSession session, @NonNull CaptureRequest request, @NonNull TotalCaptureResult result) {
+            super.onCaptureCompleted(session, request, result);
+
+            Image image = imageQueue.take();
+
+          }
+        }, cameraHandler);
+
+        captureSession.setRepeatingRequest(
+                previewCaptureRequestBuilder.build(), cameraCaptureCallback, backgroundHandler);
+      } catch (CameraAccessException e) {
+        Log.e(TAG, "Failed to set repeating request", e);
+      }
+
+
+
+
+    });
+
     messageSnackbarHelper.setMaxLines(4);
     updateSnackbarMessage();
+  }
+
+  private takePhoto() {
+    imageReader.setOnImageAvailableListener({ reader ->
+            val image = reader.acquireNextImage()
+            Log.d(TAG, "Image available in queue: ${image.timestamp}")
+            imageQueue.add(image)
+    }, imageReaderHandler)
   }
 
   @Override
@@ -512,12 +584,15 @@ public class SharedCameraActivity extends AppCompatActivity
       previewCaptureRequestBuilder =
           cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_RECORD);
 
+      stillImageCaptureRequestBuilder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
+
       // Build surfaces list, starting with ARCore provided surfaces.
       List<Surface> surfaceList = sharedCamera.getArCoreSurfaces();
 
       // Add a CPU image reader surface. On devices that don't support CPU image access, the image
       // may arrive significantly later, or not arrive at all.
       surfaceList.add(cpuImageReader.getSurface());
+//      surfaceList.add(jpgImageReader.getSurface());
 
       // Surface list should now contain three surfaces:
       // 0. sharedCamera.getSurfaceTexture()
@@ -527,6 +602,7 @@ public class SharedCameraActivity extends AppCompatActivity
       // Add ARCore surfaces and CPU image surface targets.
       for (Surface surface : surfaceList) {
         previewCaptureRequestBuilder.addTarget(surface);
+        stillImageCaptureRequestBuilder.addTarget(surface);
       }
 
       // Wrap our callback in a shared camera callback.
@@ -545,6 +621,14 @@ public class SharedCameraActivity extends AppCompatActivity
     backgroundThread = new HandlerThread("sharedCameraBackground");
     backgroundThread.start();
     backgroundHandler = new Handler(backgroundThread.getLooper());
+
+    cameraThread = new HandlerThread("cameraThread");
+    cameraThread.start();
+    cameraHandler = new Handler(cameraThread.getLooper());
+
+    imageReaderThread = new HandlerThread("imageReaderThread");
+    imageReaderThread.start();
+    imageReaderHandler = new Handler(imageReaderThread.getLooper());
   }
 
   // Stop background handler thread.
@@ -557,6 +641,28 @@ public class SharedCameraActivity extends AppCompatActivity
         backgroundHandler = null;
       } catch (InterruptedException e) {
         Log.e(TAG, "Interrupted while trying to join background handler thread", e);
+      }
+    }
+
+    if (cameraThread != null) {
+      cameraThread.quitSafely();
+      try {
+        cameraThread.join();
+        cameraThread = null;
+        cameraHandler = null;
+      } catch (InterruptedException e) {
+        Log.e(TAG, "Interrupted while trying to join camera handler thread", e);
+      }
+    }
+
+    if (imageReaderThread != null) {
+      imageReaderThread.quitSafely();
+      try {
+        imageReaderThread.join();
+        imageReaderThread = null;
+        imageReaderHandler = null;
+      } catch (InterruptedException e) {
+        Log.e(TAG, "Interrupted while trying to join imageReader handler thread", e);
       }
     }
   }
@@ -593,10 +699,19 @@ public class SharedCameraActivity extends AppCompatActivity
 
       errorCreatingSession = false;
 
+      CameraConfigFilter filter = new CameraConfigFilter(sharedSession);
+      filter.setFacingDirection(CameraConfig.FacingDirection.FRONT);
+      List<CameraConfig> cameraConfigList = sharedSession.getSupportedCameraConfigs(filter);
+      CameraConfig bestConfig = cameraConfigList.get(0);
+
+      System.out.println(bestConfig.getImageSize());
+
+
       // Enable auto focus mode while ARCore is running.
-      Config config = sharedSession.getConfig();
-      config.setFocusMode(Config.FocusMode.AUTO);
-      sharedSession.configure(config);
+//      Config config = sharedSession.getConfig();
+//      config.setFocusMode(Config.FocusMode.AUTO);
+//      sharedSession.configure(config);
+      sharedSession.setCameraConfig(bestConfig);
     }
 
     // Store the ARCore shared camera reference.
@@ -607,15 +722,29 @@ public class SharedCameraActivity extends AppCompatActivity
 
     // Use the currently configured CPU image size.
     Size desiredCpuImageSize = sharedSession.getCameraConfig().getImageSize();
+
+
+
+    String desireSize = desiredCpuImageSize.getWidth() + "x" + desiredCpuImageSize.getHeight();
+    System.out.println(desireSize);
+
+
+
     cpuImageReader =
         ImageReader.newInstance(
-            desiredCpuImageSize.getWidth(),
-            desiredCpuImageSize.getHeight(),
+//            desiredCpuImageSize.getWidth(),
+//            desiredCpuImageSize.getHeight(),
+                2500,
+            1500,
             ImageFormat.YUV_420_888,
             2);
     cpuImageReader.setOnImageAvailableListener(this, backgroundHandler);
 
+    jpgImageReader = ImageReader.newInstance(1080, 1920, ImageFormat.JPEG, 2);
+//    jpgImageReader.setOnImageAvailableListener(this, backgroundHandler);
+
     // When ARCore is running, make sure it also updates our CPU image surface.
+//    sharedCamera.setAppSurfaces(this.cameraId, Arrays.asList(cpuImageReader.getSurface(), jpgImageReader.getSurface()));
     sharedCamera.setAppSurfaces(this.cameraId, Arrays.asList(cpuImageReader.getSurface()));
 
     try {
@@ -680,8 +809,8 @@ public class SharedCameraActivity extends AppCompatActivity
       Log.w(TAG, "Not setting CONTROL_EFFECT_MODE since it can cause delays between transitions.");
     } else {
       Log.d(TAG, "Setting CONTROL_EFFECT_MODE to SEPIA in non-AR mode.");
-      captureBuilder.set(
-          CaptureRequest.CONTROL_EFFECT_MODE, CaptureRequest.CONTROL_EFFECT_MODE_SEPIA);
+//      captureBuilder.set(
+//          CaptureRequest.CONTROL_EFFECT_MODE, CaptureRequest.CONTROL_EFFECT_MODE_SEPIA);
     }
   }
 
@@ -713,10 +842,21 @@ public class SharedCameraActivity extends AppCompatActivity
   @Override
   public void onImageAvailable(ImageReader imageReader) {
     Image image = imageReader.acquireLatestImage();
+
     if (image == null) {
       Log.w(TAG, "onImageAvailable: Skipping null image.");
       return;
     }
+
+    // image 정보 획득
+    int imageHeight = image.getHeight();
+    int imageWidth = image.getWidth();
+
+    if (!isCapturable) {
+      acquireImage(image);
+      isCapturable = true;
+    }
+
 
     image.close();
     cpuImagesProcessed++;
@@ -733,7 +873,74 @@ public class SharedCameraActivity extends AppCompatActivity
                       + " \nARCore active: "
                       + arcoreActive
                       + " \nShould update surface texture: "
-                      + shouldUpdateSurfaceTexture.get()));
+                      + shouldUpdateSurfaceTexture.get()
+                      + " \nImage size: "
+                      + imageWidth + "x" + imageHeight
+              ));
+    }
+  }
+
+  private void acquireImage(Image image) {
+    Bitmap bmp = Bitmap.createBitmap(image.getWidth(), image.getHeight(), Bitmap.Config.ARGB_8888);
+    YuvToRgbConverter yuvToRgbConverter= new YuvToRgbConverter(getApplicationContext());
+    yuvToRgbConverter.yuvToRgb(image, bmp);
+
+    File output = new File(getApplicationContext().getFilesDir(), "test"+cpuImagesProcessed+".jpg");
+    try {
+      bmp.compress(Bitmap.CompressFormat.JPEG, 100, new FileOutputStream(output));
+    } catch (FileNotFoundException e) {
+      e.printStackTrace();
+    }
+
+  }
+
+  private void saveImage(Image image) {
+    File file = new File(getApplicationContext().getFilesDir(), "test"+cpuImagesProcessed+".jpg");
+    FileOutputStream output = null;
+    ByteBuffer buffer;
+    byte[] bytes;
+    boolean success = false;
+
+  // YUV_420_888 images are saved in a format of our own devising. First write out the
+  // information necessary to reconstruct the image, all as ints: width, height, U-,V-plane
+  // pixel strides, and U-,V-plane row strides. (Y-plane will have pixel-stride 1 always.)
+  // Then directly place the three planes of byte data, uncompressed.
+  //
+  // Note the YUV_420_888 format does not guarantee the last pixel makes it in these planes,
+  // so some cases are necessary at the decoding end, based on the number of bytes present.
+  // An alternative would be to also encode, prior to each plane of bytes, how many bytes are
+  // in the following plane. Perhaps in the future.
+    // "prebuffer" simply contains the meta information about the following planes.
+    ByteBuffer prebuffer = ByteBuffer.allocate(16);
+    prebuffer.putInt(image.getWidth())
+            .putInt(image.getHeight())
+            .putInt(image.getPlanes()[1].getPixelStride())
+            .putInt(image.getPlanes()[1].getRowStride());
+
+    try {
+      output = new FileOutputStream(file);
+      output.write(prebuffer.array()); // write meta information to file
+      // Now write the actual planes.
+      for (int i = 0; i<3; i++){
+        buffer = image.getPlanes()[i].getBuffer();
+        bytes = new byte[buffer.remaining()]; // makes byte array large enough to hold image
+        buffer.get(bytes); // copies image from buffer to byte array
+        output.write(bytes);    // write the byte array to file
+      }
+      success = true;
+    } catch (FileNotFoundException e) {
+      e.printStackTrace();
+    } catch (IOException e) {
+      e.printStackTrace();
+    } finally {
+      Log.v("tag","Closing image to free buffer.");
+      if (null != output) {
+        try {
+          output.close();
+        } catch (IOException e) {
+          e.printStackTrace();
+        }
+      }
     }
   }
 
@@ -854,6 +1061,7 @@ public class SharedCameraActivity extends AppCompatActivity
 
     // Determine size of the camera preview image.
     Size size = sharedSession.getCameraConfig().getTextureSize();
+    System.out.println(size.getWidth() + "x" + size.getHeight());
 
     // Determine aspect ratio of the output GL surface, accounting for the current display rotation
     // relative to the camera sensor orientation of the device.
